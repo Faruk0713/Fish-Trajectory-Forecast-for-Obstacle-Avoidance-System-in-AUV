@@ -73,3 +73,58 @@ print(f"Total Marine Targets Located: {fish_count}")
 
 # 3. Extract coordinate vectors and pass to Seq2Seq forecasting pipeline...
 ```
+
+---
+
+## 🧭 Direction-Aware Inference Scripts
+
+The Seq2Seq forecaster was trained exclusively on left-to-right (L→R) trajectories, since the source footage used a camera that panned with the fish, cancelling out real horizontal motion; a constant offset was added afterward to simulate forward travel. As a result, the model has no native exposure to right-to-left (R→L) swimming. To handle both directions correctly at inference time without retraining, these scripts detect the direction of any input window and mirror it into the model's trained orientation before mirroring the output back.
+
+* **`run_inference.py`**: Batch-tests the model across multiple windows of a trajectory CSV. For each window it runs two cases side-by-side — the native direction, and a spatially mirrored version of the *same* input — and verifies both produce identical underlying model output (only the display orientation differs). Saves one comparison plot per example plus a summary CSV with per-window MSE.
+* **`run_custom_inference.py`**: Runs the model on a manually specified 20-frame `(x_standardized, y_standardized)` sequence instead of a CSV window — useful for testing synthetic or hand-crafted trajectories in either direction.
+
+### Direction Detection & Mirroring Logic
+```python
+def detect_direction(window_xy):
+    """Fits a line through the input window's x-values; sign of the slope gives direction."""
+    x = window_xy[:, 0]
+    t = np.arange(len(x))
+    slope = np.polyfit(t, x, 1)[0]
+    return "L->R" if slope >= 0 else "R->L"
+
+def mirror_x(arr, x_min=0.0, x_max=100.0):
+    """Reflects x around the midpoint of the standardized range. Y is left untouched."""
+    mirrored = arr.copy()
+    mirrored[..., 0] = (x_min + x_max) - arr[..., 0]
+    return mirrored
+
+def predict_trajectory(model, window_xy, device="cpu"):
+    direction = detect_direction(window_xy)
+    flipped = direction == "R->L"
+    model_input = mirror_x(window_xy) if flipped else window_xy
+
+    x_tensor = torch.from_numpy(model_input.astype(np.float32)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        pred = model(x_tensor, tf_ratio=0.0)
+    pred_np = pred.squeeze(0).cpu().numpy()
+
+    if flipped:
+        pred_np = mirror_x(pred_np)  # un-mirror back to the original orientation
+
+    return {"direction": direction, "flipped": flipped, "prediction": pred_np}
+```
+
+Direction is always **computed from the input coordinates themselves** — there is no manual flag. This means the same function transparently handles either swimming direction, correctly reconstructing the model's trained (L→R) input internally regardless of which way the real trajectory happens to be moving.
+
+### Usage
+```bash
+pip install torch pandas numpy matplotlib
+
+# Batch test across multiple windows of a trajectory CSV
+python run_inference.py
+
+# Test on a manually specified 20-frame sequence
+python run_custom_inference.py
+```
+
+**Note:** Because the training data itself contains zero genuine R→L examples (a consequence of the camera-panning compensation described above), this mirroring approach is a practical inference-time fix rather than a substitute for retraining on footage with real bidirectional motion. It guarantees consistent, direction-independent forecasts from the *existing* model, but the model's underlying accuracy is still bounded by what it learned from L→R-only training data.
